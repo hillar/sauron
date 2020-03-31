@@ -4,8 +4,12 @@ import uuid
 import socket
 import json
 import sys
+import ctypes
+
+
 
 from flask import Flask, request, jsonify, redirect, url_for
+from nltk import sent_tokenize
 from multiprocessing import Process, Manager, Queue, log_to_stderr, current_process, cpu_count
 from threading import Thread, Lock
 from configparser import ConfigParser
@@ -13,7 +17,7 @@ from itertools import product
 from copy import copy
 
 from helpers import UUIDConverter, ThreadSafeDict, Error
-from helpers import tokenize, is_json
+from helpers import is_json
 
 app = Flask(__name__)
 
@@ -40,7 +44,7 @@ def check_options():
             if name.startswith(domain):
                 std_fmt = [{"odomain" : option,
                             "name" : odomain_code_mapping[option],
-                            "lang" : c.options[option],} for option in c.options]
+                            "lang" : c.options[option]} for option in c.options]
                 return jsonify({"domain": c.name.split('_')[0], "options" : std_fmt})
     else:
         raise Error(f'Authentication is missing or failed', status_code=400)
@@ -87,11 +91,12 @@ def post_job():
             if c.connected:
                 available_servers = True
 
-    if not available_servers:
-        raise Error(f'Server for {domain} domain is not connected', status_code=503)
+    # if not available_servers:
+    #     # return jsonify({"input" : body})
+    #     raise Error(f'Server for {domain} domain is not connected', status_code=503)
 
     if type(body) == str:
-        sentences = tokenize(body)
+        sentences = sent_tokenize(body)
     else:
         sentences = copy(body)
 
@@ -111,9 +116,8 @@ def post_job():
     while True:
         if job_id in RESULTS:
             if RESULTS[job_id]['status'] == 'done':
-                return jsonify({'status': 'done', 'input': body['text'], 'result': RESULTS[job_id]['text']})
-        else:
-            continue
+                return jsonify({'status': 'done', 'input': body, 'result': RESULTS[job_id]['text']})
+
 
     return str(job_id)
 
@@ -165,35 +169,45 @@ class Worker(Process):
         while True:
             with requests as r:
                 olang, ostyle = params_str.split('_')
-                olang = lang_code_mapping(olang)
+                olang = lang_code_mapping[olang]
                 text = r['text']
-                msg = {"src": text, "conf": "{},{}".format(olang, ostyle)}
-                jmsg = bytes(json.dumps(msg), 'ascii')
-                if self.connected:
-                    with self.lock:
-                        sock.sendall(jmsg)
-                        rawresponse = sock.recv(65536)
-                        response = json.loads(rawresponse)
-                    responses = tokenize(response)
+                responses = sent_tokenize(text)
+                if responses:
+                    #print(responses)
+                # print(responses)
+                # msg = {"src": text, "conf": "{},{}".format(olang, ostyle)}
+                # jmsg = bytes(json.dumps(msg), 'ascii')
+                # if self.connected:
+                #     with self.lock:
+                #         sock.sendall(jmsg)
+                #         rawresponse = sock.recv(65536)
+                #         response = json.loads(rawresponse)
+                #     responses = tokenize(response)
 
                 # Now response contains bunch of translations
                 # Need to assign pieces to respective RESULTS[job]
+                    with self.lock:
+                        r['job_ids'].put(None)
+                        for i, j in enumerate(iter(r['job_ids'].get, None)):
+                            # try:
 
-                r['job_ids'].put(None)
-                for i, j in enumerate(iter(r['job_ids'].get, None)):
-                    # try:
-                    RESULTS[j]['text'] += responses[i]
+                            RESULTS[j]['text'] += responses[i]
+                            print(i,j)
+                            #print(RESULTS[j]['text'])
 
-                    # except IndexError:
-                    #
-                    # except KeyError:
-                    #
+                            # except IndexError:
+                            #
+                            # except KeyError:
+                            #
 
-                    if RESULTS[j]['n_sen'] == len(tokenize(RESULTS[j]['text'])):
-                        RESULTS[j]['status'] = 'done'
+                            if RESULTS[j]['n_sen'] == len(sent_tokenize(RESULTS[j]['text'])):
+                                print('done')
+                                RESULTS[j]['status'] = 'done'
+                            else:
+                                print(RESULTS[j]['n_sen'], RESULTS[j]['text'])
 
-                r['n_sentences'] = 0
-                r['text'] = ''
+                        r['n_sentences'] = 0
+                        r['text'] = ''
 
     def send_messege(self, msg):
             if not self.queue.empty():
@@ -210,40 +224,44 @@ class Worker(Process):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         #sock.settimeout(2)
 
-        while True:
-            try:
-                sock.connect((self.host, self.port))
-                sock.sendall(b'HI')
-                preresponse = sock.recv(5)
-                if preresponse == b'OK':
-                    self.connected = True
-                    logging.debug(f'Connection to {self.host}:{self.port} established')
+        # while True:
+        #     try:
+        #         sock.connect((self.host, self.port))
+        #         sock.sendall(b'HI')
+        #         preresponse = sock.recv(5)
+        #         if preresponse == b'OK':
+        #             self.connected = True
+        #             logging.debug(f'Connection to {self.host}:{self.port} established')
+        #
+        #     except ConnectionRefusedError:
+        #         self.connected = False
+        #         logging.debug(f'Connection to {p.name} refused')
+        #         time.sleep(3600)
+        #         continue
+        #
+        #     except TimeoutError:
+        #         self.connected = False
+        #         logging.debug(f'Connection to {p.name} timeout')
+        #         time.sleep(3600)
+        #         continue
+        #
+        #     break
 
-            except ConnectionRefusedError:
-                self.connected = False
-                logging.debug(f'Connection to {p.name} refused')
-                time.sleep(3600)
-                continue
+        #if self.connected == True:
+        t1 = Thread(name='Consumer', target=self.consume_queue)
+        t2 = list()
+        for pair in self.prod:
+            params = f'{pair[0]}_{pair[1]}'
+            t2.append(Thread(name=params, target=self.translate, args=(params, self.requests[params], sock)))
+        #t1.daemon = True
+        t1.start()
+        for t in t2:
+            #t.daemon = True
+            t.start()
+        t1.join()
+        for t in t2:
+            t.join()
 
-            # except socket.timeout:
-            #     self.connected = False
-            #     logging.debug(f'Connection to {p.name} timeout')
-            #     time.sleep(3600)
-            #     continue
-
-            break
-
-        if self.connected == True:
-            t1 = Thread(name='Consumer', target=self.consume_queue)
-            t2 = list()
-            for pair in self.prod:
-                params = f'{pair[0]}_{pair[1]}'
-                t2.append(Thread(name=params, target=self.translate, args=(params, self.requests[params], sock)))
-            t1.daemon = True
-            t1.start()
-            for t in t2:
-                t.daemon = True
-                t.start()
 
 
 if __name__ == '__main__':
@@ -260,7 +278,7 @@ if __name__ == '__main__':
     parser = ConfigParser()
     parser.read('dev.ini')
     params = ['text', 'auth','olang','odomain']
-    odomain_code_mapping = {'fml': 'Formal','inf':'Infromal','auto':'Auto'}
+    odomain_code_mapping = {'fml': 'Formal','inf':'Informal','auto':'Auto', 'tt' : 'tt', 'cr' : 'cr'}
     lang_code_mapping = { 'est': 'et', 'lav': ' lv', 'eng': 'en', 'rus': 'ru', 'fin': 'fi', 'lit': 'lt', 'ger': 'de' }
 
     with open('./config.json') as config_file:
@@ -271,19 +289,21 @@ if __name__ == '__main__':
     manager = Manager()
     RESULTS = manager.dict()
 
-
-    for domain, conf in config.items():
-        queues_per_domain[domain] = Queue()
-        engines = conf['Workers']
-        for worker, settings in engines.items():
-            name = f'{domain}_{worker}'
-            settings['output_options'] = conf['output_options']
-            w = Worker(name, queues_per_domain[domain], **settings)
-            connections[name] = w
+    for _ , domains in config.items():
+        for domain in domains:
+            queues_per_domain[domain['name']] = Queue()
+            engines = domain['Workers']
+            for worker in engines:
+                domain_name = domain['name']
+                worker_name = worker['name']
+                name = f'{domain_name}_{worker_name}'
+                worker['settings']['output_options'] = domain['output_options']
+                w = Worker(name, queues_per_domain[domain_name], **worker['settings'])
+                connections[name] = w
 
     for n, c in connections.items():
         c.daemon = True
         c.start()
 
 
-    app.run()
+    app.run(host='translate.cloud.ut.ee', port=80, use_reloader=False)
